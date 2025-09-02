@@ -1,0 +1,44 @@
+{
+  "name": "todo-list-lambda",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serverless TODO list API (AWS Lambda) using Drizzle ORM and PostgreSQL",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/handler.js",
+  "types": "dist/handler.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "tsx watch src/handler.ts",
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint . --ext .ts",
+    "migrate": "drizzle-kit migrate",
+    "generate": "drizzle-kit generate:pg",
+    "check": "tsc --noEmit",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.31.0",
+    "pg": "^8.11.5",
+    "@neondatabase/serverless": "^0.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "drizzle-kit": "^0.24.0",
+    "eslint": "^8.57.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.29.1",
+    "prettier": "^3.2.5",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.3"
+  },
+  "drizzle-kit": {
+    "schema": "./src/schema.ts",
+    "out": "./drizzle",
+    "dialect": "postgres",
+    "verbose": true,
+    "strict": true
+  }
+}

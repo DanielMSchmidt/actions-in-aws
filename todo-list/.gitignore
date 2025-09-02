@@ -1,0 +1,51 @@
+# Node / dependencies
+node_modules/
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+
+# Build artifacts
+dist/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Coverage / testing
+coverage/
+.nyc_output/
+
+# Drizzle
+# Keep generated migrations (SQL) – do NOT ignore drizzle/*.sql
+drizzle/*.json
+drizzle/.cache/
+
+# TypeScript
+*.d.ts.map
+*.js.map
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Misc
+.eslintcache
+.cache/
