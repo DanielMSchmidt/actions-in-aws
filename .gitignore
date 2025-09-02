@@ -1,0 +1,6 @@
+lambda_build
+lambda.zip
+.terraform/
+.terraform.tfstate.lock.info
+terraform.tfstate.backup
+terraform.tfstate

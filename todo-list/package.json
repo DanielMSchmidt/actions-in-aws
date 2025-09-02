@@ -13,11 +13,13 @@
   "scripts": {
     "dev": "tsx watch src/handler.ts",
     "build": "tsc -p tsconfig.json",
+    "bundle": "esbuild src/handler.ts --bundle --platform=node --target=node18 --external:pg-native --minify --sourcemap --outfile=dist/handler.js",
+    "build:lambda": "npm run build && npm run bundle",
     "lint": "eslint . --ext .ts",
     "migrate": "drizzle-kit migrate",
     "generate": "drizzle-kit generate:pg",
     "check": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepare": "npm run build:lambda"
   },
   "dependencies": {
     "drizzle-orm": "^0.31.0",
@@ -32,7 +34,8 @@
     "eslint-plugin-import": "^2.29.1",
     "prettier": "^3.2.5",
     "tsx": "^4.7.0",
-    "typescript": "^5.4.3"
+    "typescript": "^5.4.3",
+    "esbuild": "^0.21.5"
   },
   "drizzle-kit": {
     "schema": "./src/schema.ts",

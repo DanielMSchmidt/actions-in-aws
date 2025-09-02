@@ -1,46 +1,40 @@
 #############################################
-# Terraform: Lambda + CloudFront Deployment #
+# Terraform: RDS Postgres + Lambda + CloudFront
 #############################################
 #
 # This configuration:
-#  - Builds and packages the todo-list Lambda (TypeScript project in this directory)
-#  - Deploys the Lambda with a Function URL
-#  - Fronts the Lambda Function URL with a CloudFront distribution
+#  - Creates an isolated VPC (no outbound Internet/NAT needed for the app)
+#  - Provisions a PostgreSQL RDS instance inside private subnets
+#  - Builds & deploys the todo-list Lambda (TypeScript project in this directory)
+#  - Connects Lambda to the VPC with a security group allowing DB access
+#  - Exposes the Lambda through a public Lambda Function URL
+#  - Fronts that URL with a CloudFront distribution
 #
-# Assumptions:
-#  - You are running Terraform from within: actions-in-aws/todo-list
-#  - Node.js + npm are available locally (for build step)
-#  - DATABASE_URL points at a reachable PostgreSQL instance
+# IMPORTANT (Non‑Production Caveats):
+#  - No NAT Gateway / Internet access from private subnets (Lambda only talks to RDS).
+#  - RDS is placed in private subnets and only accessible from the Lambda SG.
+#  - For production you should add:
+#       * Encrypted Secrets in AWS Secrets Manager
+#       * Automated backups / PITR, Multi-AZ, enhanced monitoring
+#       * Proper password rotation
+#       * Logging / metrics dashboards
+#       * WAF / auth in front of CloudFront
 #
-# Usage (typical local flow):
-#   export AWS_REGION=us-east-1
-#   export TF_VAR_database_url="postgres://user:pass@host:5432/db"
+# Usage:
+#   export TF_VAR_database_username="appuser"
+#   export TF_VAR_database_name="todos"
 #   terraform init
-#   terraform apply
+#   terraform apply \
+#     -var="database_username=appuser" \
+#     -var="database_name=todos"
 #
-# The build step (null_resource.build) will:
-#   - Install production dependencies (npm install --omit=dev)
-#   - Run the TypeScript build (npm run build)
-#   - Stage only the runtime artifacts into ./lambda_build
-#   - (Re)create a deployment zip via data.archive_file.lambda
+# After apply:
+#   CF_DOMAIN=$(terraform output -raw cloudfront_domain_name)
+#   curl https://$CF_DOMAIN/health
+#   curl -X POST -H 'Content-Type: application/json' \
+#        -d '{"text":"Example"}' https://$CF_DOMAIN/todos
 #
-# NOTE: For larger production systems you may prefer:
-#   - CI pipeline to produce the zip artifact
-#   - Using S3 object for Lambda code (instead of direct file upload)
-#   - Separate state / workspace management
-#
-# CloudFront:
-#  - No custom domain / ACM cert configured here (uses default *.cloudfront.net)
-#  - Caching disabled (dynamic API). Adjust TTLs or add cache policies if desired.
-#
-# Security:
-#  - Lambda Function URL is public (authorization_type = "NONE") but effectively shielded
-#    by CloudFront when you only expose the CloudFront domain externally. For strict
-#    access, add an origin custom header + Lambda@Edge or WAF rules.
-#
-# ==============================
-# Provider & Required Versions
-# ==============================
+#############################################
 
 terraform {
   required_version = ">= 1.5.0"
@@ -53,63 +47,226 @@ terraform {
       source  = "hashicorp/archive"
       version = ">= 2.4.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.5.0"
+    }
   }
 }
 
-#####################
-# Configuration Vars
-#####################
+#############################################
+# Variables
+#############################################
 
 variable "aws_region" {
   type        = string
-  description = "AWS region for deployment"
   default     = "us-east-1"
+  description = "AWS region for all resources."
 }
 
-variable "database_url" {
+variable "database_username" {
   type        = string
-  description = "PostgreSQL connection string for the todo-list Lambda"
-  sensitive   = true
+  description = "Master username for the Postgres database."
+  default     = "demo"
 }
 
-# Optionally allow overriding memory/timeout.
+variable "database_name" {
+  type        = string
+  description = "Initial database name to create."
+  default     = "tododemo"
+}
+
+variable "database_instance_class" {
+  type        = string
+  default     = "db.t3.micro"
+  description = "RDS instance class."
+}
+
+variable "database_allocated_storage_gb" {
+  type        = number
+  default     = 20
+  description = "Allocated storage (GB) for RDS."
+}
+
 variable "lambda_memory_mb" {
   type        = number
-  description = "Lambda memory size (MB)"
   default     = 256
+  description = "Lambda memory (MB)."
 }
 
 variable "lambda_timeout_sec" {
   type        = number
-  description = "Lambda timeout in seconds"
   default     = 10
+  description = "Lambda timeout (seconds)."
+}
+
+# Set to true to skip final snapshot on destroy (safer for ephemeral/dev).
+variable "skip_final_snapshot" {
+  type        = bool
+  default     = true
+  description = "Whether to skip final snapshot upon RDS destruction (NOT recommended for prod)."
 }
 
 provider "aws" {
   region = var.aws_region
 }
 
-###############################
-# Build & Package (Local Exec)
-###############################
+#############################################
+# Random Password (avoid special chars that break URI easily)
+#############################################
+
+resource "random_password" "db" {
+  length      = 24
+  special     = false
+  upper       = true
+  lower       = true
+  numeric     = true
+  min_upper   = 3
+  min_lower   = 5
+  min_numeric = 3
+}
+
+#############################################
+# Networking (Minimal VPC)
+#############################################
 #
-# This null_resource performs the local build. Each change to source files (src/*.ts),
-# package.json, or package-lock.json triggers a rebuild and new archive.
+# - 1 VPC
+# - 2 private subnets (for DB + Lambda)
+# - No NAT / IGW for simplicity
+# - Security groups:
+#     * lambda_sg: egress all
+#     * db_sg: ingress 5432 from lambda_sg
 #
-# If you prefer to build externally (CI), remove this block and supply your own zip.
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.20.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = { Name = "todo-vpc" }
+}
+
+resource "aws_subnet" "private_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.20.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = false
+  tags                    = { Name = "todo-private-a" }
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.20.2.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = false
+  tags                    = { Name = "todo-private-b" }
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_db_subnet_group" "db" {
+  name       = "todo-db-subnet-group"
+  subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  tags = {
+    Name = "todo-db-subnets"
+  }
+}
+
+resource "aws_security_group" "lambda" {
+  name        = "todo-lambda-sg"
+  description = "Security group for Lambda ENIs"
+  vpc_id      = aws_vpc.main.id
+
+  # Egress all (Lambda only needs to reach RDS internally)
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "todo-lambda-sg" }
+}
+
+resource "aws_security_group" "db" {
+  name        = "todo-db-sg"
+  description = "Allow Postgres access from Lambda security group"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "Postgres from Lambda SG"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda.id]
+  }
+
+  # (Optional) no outbound needed but AWS requires an egress rule if not using default SG
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "todo-db-sg" }
+}
+
+#############################################
+# RDS PostgreSQL Instance
+#############################################
+
+resource "aws_db_instance" "todo" {
+  identifier                 = "todo"
+  engine                     = "postgres"
+  instance_class             = var.database_instance_class
+  allocated_storage          = var.database_allocated_storage_gb
+  storage_encrypted          = true
+  db_name                    = var.database_name
+  username                   = var.database_username
+  password                   = random_password.db.result
+  port                       = 5432
+  db_subnet_group_name       = aws_db_subnet_group.db.name
+  vpc_security_group_ids     = [aws_security_group.db.id]
+  publicly_accessible        = false
+  skip_final_snapshot        = var.skip_final_snapshot
+  deletion_protection        = false
+  apply_immediately          = true
+  backup_retention_period    = 0
+  auto_minor_version_upgrade = true
+
+  # Consider performance_insights_enabled / monitoring_interval for production.
+
+  tags = {
+    Name = "todo-postgres"
+  }
+}
+
+#############################################
+# Build & Package Lambda (local exec)
+#############################################
+#
+# Optimized build:
+#  - Installs ONLY production dependencies (omit dev)
+#  - Runs the bundled build (tsc + esbuild) producing a single dist/handler.js
+#  - Removes all other compiled JS except handler.js to minimize artifact size
+#  - Archives ONLY the minimal contents (no node_modules needed because esbuild inlines deps)
+#
 
 locals {
-  # Hash of all TypeScript sources to trigger rebuild.
-  sources_hash = sha256(join(
-    "",
-    [
-      for f in fileset(path.module, "src/**/*.ts") :
-      filesha256("${path.module}/${f}")
-    ]
-  ))
-  package_lock_hash = try(filesha256("${path.module}/package-lock.json"), "")
-  package_json_hash = filesha256("${path.module}/package.json")
-  build_trigger     = sha256(join("", [local.sources_hash, local.package_json_hash, local.package_lock_hash]))
+  # Hash all TypeScript source files inside the todo-list project
+  sources_hash = sha256(join("", [
+    for f in fileset("${path.module}/todo-list", "src/**/*.ts") : filesha256("${path.module}/todo-list/${f}")
+  ]))
+  package_json_hash = filesha256("${path.module}/todo-list/package.json")
+  package_lock_hash = try(filesha256("${path.module}/todo-list/package-lock.json"), "")
+  build_trigger = sha256(join("", [
+    local.sources_hash,
+    local.package_json_hash,
+    local.package_lock_hash
+  ]))
 }
 
 resource "null_resource" "build" {
@@ -117,43 +274,52 @@ resource "null_resource" "build" {
     build_id = local.build_trigger
   }
 
-  # You can replace this with a script (e.g., ./scripts/build.sh) if preferred.
   provisioner "local-exec" {
-    working_dir = path.module
+    working_dir = "${path.module}/todo-list"
     command     = <<-EOT
       set -euo pipefail
-      echo "[BUILD] Installing production dependencies..."
-      npm install --omit=dev
-      echo "[BUILD] Compiling TypeScript..."
-      npm run build
-      echo "[BUILD] Staging artifact..."
+      echo "[BUILD] Installing dependencies"
+      if [ -f package-lock.json ]; then
+        npm ci || npm install
+      else
+        npm install
+      fi
+
+      echo "[BUILD] Bundling (tsc + esbuild)..."
+      npm run build:lambda
+
+      echo "[BUILD] Pruning dist to bundled handler only..."
+      find dist -type f ! -name 'handler.js' -delete || true
+      # Remove empty directories if any
+      find dist -type d -empty -delete || true
+
+      echo "[BUILD] Staging minimal lambda artifact..."
       rm -rf lambda_build
-      mkdir -p lambda_build
-      cp -R dist lambda_build/
-      cp -R node_modules lambda_build/
-      cp package.json lambda_build/
-      # Optional: include any native modules / additional assets if needed
-      echo "[BUILD] Build stage complete."
+      mkdir -p lambda_build/dist
+      cp dist/handler.js lambda_build/dist/
+      # (Optional) retain sourcemap by uncommenting:
+      # [ -f dist/handler.js.map ] && cp dist/handler.js.map lambda_build/dist/
+
+      echo "[BUILD] Done. Contents:"
+      find lambda_build -maxdepth 3 -type f -print
     EOT
   }
 }
 
-data "archive_file" "lambda" {
+data "archive_file" "lambda_zip" {
   depends_on  = [null_resource.build]
   type        = "zip"
-  source_dir  = "${path.module}/lambda_build"
+  source_dir  = "${path.module}/todo-list/lambda_build"
   output_path = "${path.module}/lambda.zip"
 }
 
-#################
-# IAM For Lambda
-#################
+#############################################
+# IAM Role & Policies
+#############################################
 
-data "aws_iam_policy_document" "lambda_assume_role" {
+data "aws_iam_policy_document" "lambda_assume" {
   statement {
-    sid     = "LambdaAssumeRole"
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
@@ -162,24 +328,34 @@ data "aws_iam_policy_document" "lambda_assume_role" {
 }
 
 resource "aws_iam_role" "lambda_exec" {
-  name               = "todo-list-lambda-exec"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
-  description        = "Execution role for the todo-list Lambda"
+  name               = "todo-lambda-exec-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  description        = "Execution role for todo-list Lambda."
 }
 
-# Basic logging policy attachment.
 resource "aws_iam_role_policy_attachment" "lambda_basic_logs" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-#####################
-# Lambda Deployment
-#####################
+# Added to allow Lambda functions configured for VPC access to manage ENIs
+resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+#############################################
+# Lambda Function
+#############################################
+
+# Build the Postgres connection string for Lambda environment.
+locals {
+  database_connection_string = "postgres://${var.database_username}:${random_password.db.result}@${aws_db_instance.todo.address}:${aws_db_instance.todo.port}/${var.database_name}"
+}
 
 resource "aws_lambda_function" "todo" {
   function_name = "todo-list-api"
-  description   = "Serverless TODO list API (Drizzle + PostgreSQL)"
+  description   = "Serverless TODO list API with Drizzle + RDS Postgres"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "dist/handler.handler"
   runtime       = "nodejs18.x"
@@ -187,33 +363,26 @@ resource "aws_lambda_function" "todo" {
   timeout       = var.lambda_timeout_sec
   publish       = true
 
-  filename         = data.archive_file.lambda.output_path
-  source_code_hash = data.archive_file.lambda.output_base64sha256
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
   environment {
     variables = {
-      DATABASE_URL = var.database_url
-      # Add other environment variables as needed
+      DATABASE_URL = local.database_connection_string
     }
   }
 
-  # Optional concurrency controls:
-  # reserved_concurrent_executions = 10
-  lifecycle {
-    ignore_changes = [
-      # Ignore runtime patch updates (if AWS auto-patches)
-    ]
+  vpc_config {
+    security_group_ids = [aws_security_group.lambda.id]
+    subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
   }
+
+  depends_on = [aws_db_instance.todo]
 }
 
-#########################
-# Public Function URL
-#########################
-# Used as the origin for CloudFront.
-# NOTE: If you want to restrict direct access, consider:
-#  - Setting up a CloudFront origin custom header and rejecting requests
-#    without that header in the Lambda code (authorization layer)
-#  - Or moving behind API Gateway for advanced routing/auth.
+#############################################
+# Lambda Function URL
+#############################################
 
 resource "aws_lambda_function_url" "todo" {
   function_name      = aws_lambda_function.todo.function_name
@@ -222,37 +391,26 @@ resource "aws_lambda_function_url" "todo" {
   cors {
     allow_credentials = false
     allow_headers     = ["*"]
-    allow_methods     = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+    allow_methods     = ["GET", "POST", "PATCH", "DELETE"]
     allow_origins     = ["*"]
     max_age           = 3600
   }
 }
 
-#############################
-# CloudFront Distribution
-#############################
-# Points to the Lambda Function URL. Caching is effectively disabled
-# to ensure real-time API behavior.
+#############################################
+# CloudFront Distribution (Origin = Lambda Function URL)
+#############################################
 
 locals {
-  lambda_function_url_domain = replace(aws_lambda_function_url.todo.function_url, "https://", "")
-}
-
-resource "aws_cloudfront_origin_access_control" "lambda_oac" {
-  name                              = "todo-lambda-oac"
-  description                       = "OAC placeholder (not strictly required for function URL)"
-  origin_access_control_origin_type = "custom"
-  signing_behavior                  = "never"
-  signing_protocol                  = "sigv4"
+  lambda_function_url_domain = trimsuffix(replace(aws_lambda_function_url.todo.function_url, "https://", ""), "/")
 }
 
 resource "aws_cloudfront_distribution" "api" {
-  enabled             = true
-  comment             = "CloudFront distribution for todo-list Lambda"
-  price_class         = "PriceClass_100"
-  default_root_object = ""
-  http_version        = "http2"
-  is_ipv6_enabled     = true
+  enabled         = true
+  comment         = "CloudFront for todo-list Lambda"
+  price_class     = "PriceClass_100"
+  is_ipv6_enabled = true
+  http_version    = "http2"
 
   origin {
     origin_id   = "todo-lambda-origin"
@@ -264,18 +422,15 @@ resource "aws_cloudfront_distribution" "api" {
       origin_protocol_policy = "https-only"
       origin_ssl_protocols   = ["TLSv1.2"]
     }
-
-    origin_access_control_id = aws_cloudfront_origin_access_control.lambda_oac.id
   }
 
   default_cache_behavior {
     target_origin_id       = "todo-lambda-origin"
     viewer_protocol_policy = "redirect-to-https"
 
-    allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    allowed_methods = ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"]
     cached_methods  = ["GET", "HEAD"]
 
-    # Legacy forwarding configuration (simpler for demo). In production prefer custom cache/origin request policies.
     forwarded_values {
       query_string = true
       headers      = ["*"]
@@ -302,43 +457,69 @@ resource "aws_cloudfront_distribution" "api" {
   depends_on = [aws_lambda_function.todo]
 }
 
-############
+#############################################
 # Outputs
-############
+#############################################
+
+output "database_endpoint" {
+  description = "RDS endpoint (host:port)."
+  value       = aws_db_instance.todo.address
+}
+
+output "database_name" {
+  description = "Database name."
+  value       = var.database_name
+}
+
+output "database_username" {
+  description = "Database master username."
+  value       = var.database_username
+}
+
+output "database_password" {
+  description = "Database master password (sensitive)."
+  value       = random_password.db.result
+  sensitive   = true
+}
+
+output "database_connection_string" {
+  description = "Postgres connection string used by Lambda (sensitive)."
+  value       = local.database_connection_string
+  sensitive   = true
+}
 
 output "lambda_function_name" {
-  description = "Deployed Lambda function name"
   value       = aws_lambda_function.todo.function_name
+  description = "Lambda function name."
 }
 
 output "lambda_function_version" {
-  description = "Published Lambda function version"
   value       = aws_lambda_function.todo.version
+  description = "Published version."
 }
 
 output "lambda_function_url" {
-  description = "Direct Lambda Function URL (public). Prefer using CloudFront domain."
   value       = aws_lambda_function_url.todo.function_url
+  description = "Direct Lambda Function URL."
 }
 
 output "cloudfront_domain_name" {
-  description = "CloudFront distribution domain for the API"
   value       = aws_cloudfront_distribution.api.domain_name
+  description = "CloudFront domain to access the API."
 }
 
 output "api_base_url" {
-  description = "Base HTTPS URL for invoking the API through CloudFront"
   value       = "https://${aws_cloudfront_distribution.api.domain_name}"
+  description = "Base CloudFront URL for the API."
 }
 
-############################################
-# Post-Apply Test (example curl commands):
+#############################################
+# Post-Apply Quick Test:
 #
-#   CF_DOMAIN=$(terraform output -raw cloudfront_domain_name)
-#   curl https://$CF_DOMAIN/health
+#   CF=$(terraform output -raw cloudfront_domain_name)
+#   curl https://$CF/health
 #   curl -X POST -H 'Content-Type: application/json' \
-#        -d '{"text":"Hello"}' https://$CF_DOMAIN/todos
-#   curl https://$CF_DOMAIN/todos
+#        -d '{"text":"Test"}' https://$CF/todos
+#   curl https://$CF/todos
 #
-# (Expect JSON responses as defined in the handler.)
-############################################
+#############################################

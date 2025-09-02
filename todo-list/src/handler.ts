@@ -12,7 +12,7 @@
  * All successful responses are JSON: { data: ..., meta?: ... }
  * Error responses: { error: { message: string } }
  *
- * This file is intentionally dependency‑light to fit well in a Lambda bundle.
+ * This file is intentionally dependency‑light to fit well in a Lambda bundle. When bundled with esbuild (see package scripts) keep imports minimal to maintain a small deployment size.
  */
 
 import { createTodo, listTodos, setTodoCompleted, deleteTodo, healthCheck } from './schema';

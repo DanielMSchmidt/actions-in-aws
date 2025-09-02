@@ -246,11 +246,31 @@ Create a `lambda.Function` with:
 
 ## Build
 
+Development / type checking:
 ```bash
 npm run build
 ```
 
-Outputs to `dist/`.
+Optimized Lambda bundle (TypeScript compile + esbuild tree‑shaken single file):
+```bash
+npm run build:lambda
+```
+
+Outputs:
+- TypeScript compilation artifacts: `dist/*`
+- Esbuild bundled & minified handler: `dist/handler.js`
+
+Why bundle?
+- Reduces number of files (faster upload & cold start)
+- Eliminates unused Drizzle / pg code paths
+- Excludes optional native modules (`pg-native`) for smaller size
+
+Further size reductions (optional):
+- Use `npm ci --omit=dev` (or `npm install --omit=dev`) before zipping
+- Drop source maps for production (remove `--sourcemap`)
+- Remove unused drivers (`@neondatabase/serverless` if not needed)
+- Leverage Lambda Layers for shared heavy dependencies
+
 
 To perform a type-only check:
 ```bash
@@ -323,11 +343,33 @@ Ideas:
 
 ---
 
-## Performance Considerations
+## Performance & Deployment Size Considerations
 
 - Minimal dependencies = smaller cold start footprint.
 - `pg` pool limited to 3 connections to avoid exhausting DB with many warm executions.
 - Avoids large frameworks (Express/Fastify) to keep bundle small.
+
+### Deployment Size Optimization
+
+If the deployment zip approaches or exceeds Lambda limits (50 MB zipped / 250 MB unzipped), apply / review these tactics (many are already implemented):
+
+1. Bundle with esbuild to tree‑shake and minify:
+   ```bash
+   npm run build:lambda
+   ```
+2. Install only production dependencies before packaging:
+   ```bash
+   npm ci --omit=dev   # or: npm install --omit=dev
+   ```
+3. Exclude optional / native modules you do not use (already marking `pg-native` external).
+4. Remove unused libraries (e.g. `@neondatabase/serverless` if not needed).
+5. Omit source maps in production (remove `--sourcemap` flag) to shrink size further.
+6. Avoid bundling AWS SDK v2 (`aws-sdk`)—it is provided in the Lambda runtime.
+7. Avoid large JSON/data files, tests, docs in the artifact (only ship `dist/` + needed runtime files).
+8. Use Lambda Layers if you must share heavier dependencies across multiple functions.
+9. Ensure code is side‑effect free where possible so bundlers can prune unused exports.
+10. Keep environment variable driven logic minimal so dead code elimination is effective.
+
 
 ---
 
